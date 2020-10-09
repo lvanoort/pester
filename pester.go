@@ -45,8 +45,12 @@ type Client struct {
 
 	Transport     http.RoundTripper
 	CheckRedirect func(req *http.Request, via []*http.Request) error
-	Jar           http.CookieJar
-	Timeout       time.Duration
+
+	// Hook to customize logic checking if a request is done or if it is a candidate to be retried.
+	// The retryOn429 parameter is for backwards compatibility with RetryOn429 value on Client
+	CheckIsDone func(req *http.Request, res *http.Response, retryOnHTTP429 bool) bool
+	Jar         http.CookieJar
+	Timeout     time.Duration
 
 	// pester specific
 	Concurrency    int
@@ -112,6 +116,7 @@ func New() *Client {
 		MaxRetries:     DefaultClient.MaxRetries,
 		Backoff:        DefaultClient.Backoff,
 		ErrLog:         DefaultClient.ErrLog,
+		CheckIsDone:    DefaultClient.CheckIsDone,
 		wg:             &sync.WaitGroup{},
 		RetryOnHTTP429: false,
 	}
@@ -136,7 +141,7 @@ type ContextLogHook func(ctx context.Context, e ErrEntry)
 type BackoffStrategy func(retry int) time.Duration
 
 // DefaultClient provides sensible defaults
-var DefaultClient = &Client{Concurrency: 1, MaxRetries: 3, Backoff: DefaultBackoff, ErrLog: []ErrEntry{}}
+var DefaultClient = &Client{Concurrency: 1, MaxRetries: 3, Backoff: DefaultBackoff, ErrLog: []ErrEntry{}, CheckIsDone: DefaultCheckIsDone}
 
 // DefaultBackoff always returns 1 second
 func DefaultBackoff(_ int) time.Duration {
@@ -163,6 +168,12 @@ func LinearBackoff(i int) time.Duration {
 // with +/- 0-33% to prevent sychronized reuqests.
 func LinearJitterBackoff(i int) time.Duration {
 	return jitter(i)
+}
+
+// DefaultCheckShouldRetry emulates
+func DefaultCheckIsDone(req *http.Request, resp *http.Response, retryOnHTTP429 bool) bool {
+	// Only retry (ie, continue the loop) on 5xx status codes and 429
+	return resp.StatusCode < http.StatusInternalServerError && (resp.StatusCode != http.StatusTooManyRequests || (resp.StatusCode == http.StatusTooManyRequests && !retryOnHTTP429))
 }
 
 // jitter keeps the +/- 0-33% logic in one place
@@ -295,11 +306,14 @@ func (c *Client) pester(p params) (*http.Response, error) {
 
 				resp, err := httpClient.Do(req)
 				// Early return if we have a valid result
-				// Only retry (ie, continue the loop) on 5xx status codes and 429
-				if err == nil && resp.StatusCode < http.StatusInternalServerError && (resp.StatusCode != http.StatusTooManyRequests || (resp.StatusCode == http.StatusTooManyRequests && !c.RetryOnHTTP429)) {
+				if err == nil && c.CheckIsDone(req, resp, c.RetryOnHTTP429) {
 					multiplexCh <- result{resp: resp, err: err, req: n, retry: i}
 					return
 				}
+				// if err == nil && resp.StatusCode < http.StatusInternalServerError && (resp.StatusCode != http.StatusTooManyRequests || (resp.StatusCode == http.StatusTooManyRequests && !c.RetryOnHTTP429)) {
+				// 	multiplexCh <- result{resp: resp, err: err, req: n, retry: i}
+				// 	return
+				// }
 
 				loggingContext := req.Context()
 				c.log(
